@@ -14,3 +14,11 @@ tests/
 vcpkg/
 .prettierrc.js
 .readthedocs.yaml
+nerstudio/__pycacher__
+nerstudio/cameras/
+nerstudio/engine/
+nerstudio/exporter/
+nerstudio/utils/
+nerstudio/viewer/
+nerstudio/__init.__.py
+nerstudio/py.typed
