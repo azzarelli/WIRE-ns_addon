@@ -1,0 +1,16 @@
+OUTPUTS/
+.github/
+.vscode/
+colab/
+DATA/
+Dockerfile
+docs/
+exports/
+nerfstudio.egg-info/
+pyproject.toml
+scripts/
+setup.cfg
+tests/
+vcpkg/
+.prettierrc.js
+.readthedocs.yaml
