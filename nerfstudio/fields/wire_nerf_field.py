@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Classic NeRF field"""
+"""Wire NeRF field"""
 
 
 from typing import Dict, Optional, Tuple
@@ -36,16 +36,14 @@ from nerfstudio.fields.base_field import Field
 
 
 class WIREField(Field):
-    """NeRF Field
+    """Wire NeRF Field
 
     Args:
-        position_encoding: Position encoder.
-        direction_encoding: Direction encoder.
-        base_mlp_num_layers: Number of layers for base MLP.
-        base_mlp_layer_width: Width of base MLP layers.
-        head_mlp_num_layers: Number of layer for output head MLP.
-        head_mlp_layer_width: Width of output head MLP layers.
-        skip_connections: Where to add skip connection in base MLP.
+        tx_mlp_num_layers: Number of layers for tx MLP.
+        tx_mlp_layer_width: Width of tx MLP layers.
+        colour_mlp_num_layers: Number of layer for output colour MLP.
+        colour_mlp_layer_width: Width of output colour MLP layers.
+        skip_connections: Where to add skip connection in tx MLP.
         use_integrated_encoding: Used integrated samples as encoding input.
         spatial_distortion: Spatial distortion.
     """
@@ -53,79 +51,69 @@ class WIREField(Field):
     def __init__(
         self,
         input_dims: int = 3,
-        direction_encoding: Encoding = Identity(in_dim=3),
 
         trainable:bool=False,
 
-        base_mlp_num_layers: int = 8,
-        base_mlp_layer_width: int = 256,
+        tx_mlp_num_layers: int = 4,
+        tx_mlp_layer_width: int = 184,
 
-        base_mlp_activation_type: str = 'complex_gabor',
-        base_sigma: float = 10.0,
-        base_omega: float = 10.0,
+        tx_sigma: float = 10.0,
+        tx_omega: float = 10.0,
         
-        head_mlp_num_layers: int = 2,
-        head_mlp_layer_width: int = 128,
-        head_sigma: float = 10.0,
-        head_omega: float = 10.0,
+        colour_mlp_num_layers: int = 4,
+        colour_mlp_layer_width: int = 184,
+        colour_sigma: float = 10.0,
+        colour_omega: float = 10.0,
 
-        head_mlp_activation_type: str = 'complex_gabor',
-
-
-        skip_connections: Tuple[int] = (4,),
-        field_heads: Tuple[FieldHead] = (RGBFieldHead(),),
-        use_integrated_encoding: bool = False,
+        tx_mlp_activation_type: str = 'complex_gabor',
+        colour_mlp_activation_type: str = 'complex_gabor',
         spatial_distortion: Optional[SpatialDistortion] = None,
+
+        field_colours: Tuple[FieldHead] = (RGBFieldHead(),),
+
     ) -> None:
         super().__init__()
 
-        self.direction_encoding = direction_encoding
-        self.use_integrated_encoding = use_integrated_encoding
         self.spatial_distortion = spatial_distortion
 
-        self.mlp_base = WMLP(
+        self.mlp_tx = WMLP(
             in_dim=input_dims,
-            num_layers=base_mlp_num_layers,
-            layer_width=base_mlp_layer_width,
-            activation_type=base_mlp_activation_type,
-            omega= base_omega,
-            sigma = base_sigma,
+            num_layers=tx_mlp_num_layers,
+            layer_width=tx_mlp_layer_width,
+            activation_type=tx_mlp_activation_type,
+            omega= tx_omega,
+            sigma = tx_sigma,
             trainable=trainable
         )
 
-        self.mlp_head = MLP(
-            in_dim=self.mlp_base.get_out_dim() + self.direction_encoding.get_out_dim(),
-            num_layers=head_mlp_num_layers,
-            layer_width=head_mlp_layer_width,
-            out_activation=nn.ReLU(),
+        self.mlp_colour = WMLP(
+            in_dim=input_dims+3,
+            num_layers=colour_mlp_num_layers,
+            layer_width=colour_mlp_layer_width,
+            activation_type=colour_mlp_activation_type,
+            omega= colour_omega,
+            sigma = colour_sigma,
+            trainable=trainable
         )
 
-        # self.mlp_head = WMLP(
-        #     in_dim=self.mlp_base.get_out_dim() + self.direction_encoding.get_out_dim(),
-        #     num_layers=head_mlp_num_layers,
-        #     layer_width=head_mlp_layer_width,
-        #     activation_type=head_mlp_activation_type,
-        #     omega= head_omega,
-        #     sigma = head_sigma,
-        #     trainable=trainable
-        # )
 
-        self.field_output_density = DensityFieldHead(in_dim=self.mlp_base.get_out_dim())
-        self.field_heads = nn.ModuleList(field_heads)
-        for field_head in self.field_heads:
-            field_head.set_in_dim(self.mlp_head.get_out_dim())  # type: ignore
+        self.field_output_density = DensityFieldHead(in_dim=self.mlp_tx.get_out_dim())
+        self.field_colours = nn.ModuleList(field_colours)
+        for field_colour in self.field_colours:
+            field_colour.set_in_dim(self.mlp_colour.get_out_dim())  # type: ignore
 
     def get_density(self, ray_samples: RaySamples):
-        base_mlp_out = self.mlp_base(ray_samples.frustums.get_positions())
-        density = self.field_output_density(base_mlp_out.real)
-        return density, base_mlp_out
+        tx_mlp_out = self.mlp_tx(ray_samples.frustums.get_positions())
+        density = self.field_output_density(tx_mlp_out.real)
+        return density, tx_mlp_out
 
     def get_outputs(
         self, ray_samples: RaySamples, density_embedding: Optional[TensorType] = None
     ) -> Dict[FieldHeadNames, TensorType]:
         outputs = {}
-        for field_head in self.field_heads:
-            encoded_dir = self.direction_encoding(ray_samples.frustums.directions)
-            mlp_out = self.mlp_head(torch.cat([encoded_dir, density_embedding.real], dim=-1))  # type: ignore
-            outputs[field_head.field_head_name] = field_head(mlp_out)
+        for field_colour in self.field_colours:
+            # encoded_dir = self.direction_encoding(ray_samples.frustums.directions)
+            # print(ray_samples.frustums.get_positions().shape, ray_samples.frustums.)
+            mlp_out = self.mlp_colour(torch.cat([ray_samples.frustums.get_positions(), ray_samples.frustums.directions], dim=-1) ) #torch.cat([density_embedding.real], dim=-1))  # type: ignore
+            outputs[field_colour.field_head_name] = field_colour(mlp_out.real)
         return outputs

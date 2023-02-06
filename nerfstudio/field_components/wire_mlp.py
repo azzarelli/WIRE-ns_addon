@@ -135,7 +135,7 @@ class WIREMLP(FieldComponent):
                                 omega=omega, sigma=sigma, 
                                 trainable=trainable, dtype=dtype)
 
-    def build_nn_modules(self, dtype=None, in_features:Optional[int]=None, out_features:Optional[int]=None, 
+    def build_nn_modules(self, dtype=None, in_features:Optional[int]=None,
                          hidden_layers:Optional[int]=None, hidden_features:Optional[int]=None,
                          omega:Optional[float]=10.0, sigma:Optional[float]=10.0,
                          trainable:bool=False) -> None:
@@ -153,7 +153,6 @@ class WIREMLP(FieldComponent):
                                         omega0=omega,
                                         sigma0=sigma))
 
-        print(hidden_features, self.out_dim)
         final_linear = nn.Linear(hidden_features,
                                  self.out_dim,
                                  dtype=dtype)            
@@ -170,8 +169,17 @@ class WIREMLP(FieldComponent):
         Returns:
             MLP network output
         """
-        output = self.net(in_tensor)
+        # print(in_tensor.shape)
+        x = in_tensor
+        for i, layer in enumerate(self.net):
+            # as checked in `build_nn_modules`, 0 should not be in `_skip_connections`
+            # if i != 0:
+            # #     x = torch.cat([in_tensor, x], -1)
+            # print(i)
+            x = layer(x)
+        return x
+        # output = self.net(in_tensor)
 
-        if self.wavelet == 'gabor':
-            return output.real
-        return output
+        # if self.wavelet == 'gabor':
+        #     return output.real
+        # return output

@@ -153,7 +153,6 @@ method_configs["instant-ngp"] = TrainerConfig(
     vis="viewer",
 )
 
-
 method_configs["instant-ngp-bounded"] = TrainerConfig(
     method_name="instant-ngp-bounded",
     steps_per_eval_batch=500,
@@ -180,7 +179,6 @@ method_configs["instant-ngp-bounded"] = TrainerConfig(
     viewer=ViewerConfig(num_rays_per_chunk=64000),
     vis="viewer",
 )
-
 
 method_configs["mipnerf"] = TrainerConfig(
     method_name="mipnerf",
@@ -333,18 +331,21 @@ method_configs["wire-nerf"] = TrainerConfig(
         datamanager=VanillaDataManagerConfig(
             dataparser=NerfstudioDataParserConfig(),
         ),
-        model=WIREModelConfig(_target=WireModel),
+        model=WIREModelConfig(_target=WireModel,
+        
+        loss_coefficients={"rgb_loss_colour": 0.1, "rgb_loss_tx": 1.0},
+            num_colour_samples=128,
+            num_importance_samples=128,
+            eval_num_rays_per_chunk=1024,),
     ),
     optimizers={
         "fields": {
             "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
             "scheduler": None,
         },
-        "temporal_distortion": {
-            "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
-            "scheduler": None,
-        },
     },
+    # viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    # vis="viewer",
 )
 
 AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[  # Don't show unparseable (fixed) arguments in helptext.
