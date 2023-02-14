@@ -584,3 +584,209 @@ class ProposalNetworkSampler(Sampler):
 
         assert ray_samples is not None
         return ray_samples, weights_list, ray_samples_list
+
+
+# Copyright 2022 The Nerfstudio Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Collection of sampling strategies
+"""
+
+from abc import abstractmethod
+from typing import Callable, List, Optional, Tuple
+
+import nerfacc
+import torch
+from nerfacc import OccupancyGrid
+from torch import nn
+from torchtyping import TensorType
+
+from nerfstudio.cameras.rays import Frustums, RayBundle, RaySamples
+
+
+class Sampler(nn.Module):
+    """Generate Samples
+
+    Args:
+        num_samples: number of samples to take
+    """
+
+    def __init__(
+        self,
+        num_samples: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.num_samples = num_samples
+
+    @abstractmethod
+    def generate_ray_samples(self) -> RaySamples:
+        """Generate Ray Samples"""
+
+    def forward(self, *args, **kwargs) -> RaySamples:
+        """Generate ray samples"""
+        return self.generate_ray_samples(*args, **kwargs)
+
+
+class SpacedSampler(Sampler):
+    """Sample points according to a function.
+
+    Args:
+        num_samples: Number of samples per ray
+        spacing_fn: Function that dictates sample spacing (ie `lambda x : x` is uniform).
+        spacing_fn_inv: The inverse of spacing_fn.
+        train_stratified: Use stratified sampling during training. Defaults to True
+        single_jitter: Use a same random jitter for all samples along a ray. Defaults to False
+    """
+
+    def __init__(
+        self,
+        spacing_fn: Callable,
+        spacing_fn_inv: Callable,
+        num_samples: Optional[int] = None,
+        train_stratified=True,
+        single_jitter=False,
+    ) -> None:
+        super().__init__(num_samples=num_samples)
+        self.train_stratified = train_stratified
+        self.single_jitter = single_jitter
+        self.spacing_fn = spacing_fn
+        self.spacing_fn_inv = spacing_fn_inv
+
+    def generate_ray_samples(
+        self,
+        ray_bundle: Optional[RayBundle] = None,
+        num_samples: Optional[int] = None,
+    ) -> RaySamples:
+        """Generates position samples according to spacing function.
+
+        Args:
+            ray_bundle: Rays to generate samples for
+            num_samples: Number of samples per ray
+
+        Returns:
+            Positions and deltas for samples along a ray
+        """
+        assert ray_bundle is not None
+        assert ray_bundle.nears is not None
+        assert ray_bundle.fars is not None
+
+        num_samples = num_samples or self.num_samples
+        assert num_samples is not None
+        num_rays = ray_bundle.origins.shape[0]
+
+        bins = torch.linspace(0.0, 1.0, num_samples + 1).to(ray_bundle.origins.device)[None, ...]  # [1, num_samples+1]
+
+        # TODO More complicated than it needs to be.
+        if self.train_stratified and self.training:
+            if self.single_jitter:
+                t_rand = torch.rand((num_rays, 1), dtype=bins.dtype, device=bins.device)
+            else:
+                t_rand = torch.rand((num_rays, num_samples + 1), dtype=bins.dtype, device=bins.device)
+            bin_centers = (bins[..., 1:] + bins[..., :-1]) / 2.0
+            bin_upper = torch.cat([bin_centers, bins[..., -1:]], -1)
+            bin_lower = torch.cat([bins[..., :1], bin_centers], -1)
+            bins = bin_lower + (bin_upper - bin_lower) * t_rand
+
+        s_near, s_far = (self.spacing_fn(x) for x in (ray_bundle.nears, ray_bundle.fars))
+        spacing_to_euclidean_fn = lambda x: self.spacing_fn_inv(x * s_far + (1 - x) * s_near)
+        euclidean_bins = spacing_to_euclidean_fn(bins)  # [num_rays, num_samples+1]
+
+        ray_samples = ray_bundle.get_ray_samples(
+            bin_starts=euclidean_bins[..., :-1, None],
+            bin_ends=euclidean_bins[..., 1:, None],
+            spacing_starts=bins[..., :-1, None],
+            spacing_ends=bins[..., 1:, None],
+            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
+        )
+
+        return ray_samples
+
+
+
+from torch import nn
+
+
+class IRNetworkSampler(nn.Module):
+    """Sampler that uses a proposal network to generate samples."""
+    def __init__(
+        self,
+        in_dim: int,
+        num_layers: int,
+        layer_width: int,
+        out_dim: Optional[int] = None,
+        activation: Optional[nn.Module] = nn.ReLU(),
+        out_activation: Optional[nn.Module] = None,
+    ) -> None:
+
+        super().__init__()
+        self.in_dim = in_dim
+        assert self.in_dim > 0
+        self.out_dim = out_dim if out_dim is not None else layer_width
+        self.num_layers = num_layers
+        self.layer_width = layer_width
+        self.activation = activation
+        self.out_activation = out_activation
+
+        self.build_nn_modules()
+
+    def build_nn_modules(self) -> None:
+        """Initialize multi-layer perceptron."""
+        layers = []
+        if self.num_layers == 1:
+            layers.append(nn.Linear(self.in_dim, self.out_dim))
+        else:
+            for i in range(self.num_layers - 1):
+                if i == 0:
+                    layers.append(nn.Linear(self.in_dim, self.layer_width))
+                else:
+                    layers.append(nn.Linear(self.layer_width, self.layer_width))
+            layers.append(nn.Linear(self.layer_width, self.out_dim))
+        self.layers = nn.ModuleList(layers)
+    
+    def forward(self, in_tensor: TensorType["bs":..., "in_dim"]) -> TensorType["bs":..., "out_dim"]:
+        """Process input with a multilayer perceptron.
+
+        Args:
+            in_tensor: Network input
+
+        Returns:
+            MLP network output
+        """
+        x = in_tensor
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if self.activation is not None and i < len(self.layers) - 1:
+                x = self.activation(x)
+        if self.out_activation is not None:
+            x = self.out_activation(x)
+        return x
+
+    def generate_ray_samples(
+        self,
+        ray_bundle: Optional[RayBundle] = None
+    ) -> Tuple[RaySamples, List, List]:
+        assert ray_bundle is not None
+        ray_samples_list = []
+        ray_samples = None
+
+        
+        # TODO - Pass in ray parametes (i.e. viewing direction and start & end position of ray)
+        rayparams = 0 
+        sample_indexes = self.forward(rayparams)
+
+        # TODO - Go from sample indexs (values 0 to 1 in a range length)
+
+        assert ray_samples is not None
+        return ray_samples

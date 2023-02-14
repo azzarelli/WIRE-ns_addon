@@ -13,11 +13,13 @@
 # limitations under the License.
 
 """
-Implementation of mip-NeRF.
+Implementation of vanilla nerf.
 """
+
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Type
 
 import torch
 from torch.nn import Parameter
@@ -26,11 +28,13 @@ from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
+from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import MSELoss
-from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
+from nerfstudio.model_components.ray_samplers import IRNetworkSampler, PDFSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
     DepthRenderer,
@@ -40,40 +44,68 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, colors, misc
 
 
-class MipNerfModel(Model):
-    """mip-NeRF model
+@dataclass
+class VanillaModelConfig(ModelConfig):
+    """Vanilla Model Config"""
+
+    _target: Type = field(default_factory=lambda: NeRFModel)
+    num_coarse_samples: int = 64
+    """Number of samples in coarse field evaluation"""
+    num_importance_samples: int = 128
+    """Number of samples in fine field evaluation"""
+
+    enable_temporal_distortion: bool = False
+    """Specifies whether or not to include ray warping based on time."""
+    temporal_distortion_params: Dict[str, Any] = to_immutable_dict({"kind": TemporalDistortionKind.DNERF})
+    """Parameters to instantiate temporal distortion with"""
+
+
+class NeRFModel(Model):
+    """Vanilla NeRF model
 
     Args:
-        config: MipNerf configuration to instantiate model
+        config: Basic NeRF configuration to instantiate model
     """
 
     def __init__(
         self,
-        config: ModelConfig,
+        config: VanillaModelConfig,
         **kwargs,
     ) -> None:
-        self.field = None
-        super().__init__(config=config, **kwargs)
+        self.field_coarse = None
+        self.field_fine = None
+        self.temporal_distortion = None
+
+        super().__init__(
+            config=config,
+            **kwargs,
+        )
 
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
 
-        # setting up fields
+        # fields
         position_encoding = NeRFEncoding(
-            in_dim=3, num_frequencies=16, min_freq_exp=0.0, max_freq_exp=16.0, include_input=True
+            in_dim=3, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True
         )
         direction_encoding = NeRFEncoding(
             in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=4.0, include_input=True
         )
 
-        self.field = NeRFField(
-            position_encoding=position_encoding, direction_encoding=direction_encoding, use_integrated_encoding=True
+        self.field_coarse = NeRFField(
+            position_encoding=position_encoding,
+            direction_encoding=direction_encoding,
+        )
+
+        self.field_fine = NeRFField(
+            position_encoding=position_encoding,
+            direction_encoding=direction_encoding,
         )
 
         # samplers
-        self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
-        self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples, include_original=False)
+        self.sampler = IRNetworkSampler(num_samples=self.config.num_coarse_samples)
+        self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples)
 
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
@@ -88,36 +120,49 @@ class MipNerfModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
+        if getattr(self.config, "enable_temporal_distortion", False):
+            params = self.config.temporal_distortion_params
+            kind = params.pop("kind")
+            self.temporal_distortion = kind.to_temporal_distortion(params)
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        if self.field is None:
+        if self.field_coarse is None or self.field_fine is None:
             raise ValueError("populate_fields() must be called before get_param_groups")
-        param_groups["fields"] = list(self.field.parameters())
+        param_groups["fields"] = list(self.field_coarse.parameters()) + list(self.field_fine.parameters())
+        if self.temporal_distortion is not None:
+            param_groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
         return param_groups
 
     def get_outputs(self, ray_bundle: RayBundle):
 
-        if self.field is None:
+        if self.field_coarse is None or self.field_fine is None:
             raise ValueError("populate_fields() must be called before get_outputs")
 
-        # uniform sampling
-        ray_samples_uniform = self.sampler_uniform(ray_bundle)
+        # NN sampling
+        ray_samples = self.sampler(ray_bundle)
+        if self.temporal_distortion is not None:
+            offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
+            ray_samples.frustums.set_offsets(offsets)
 
-        # First pass:
-        field_outputs_coarse = self.field.forward(ray_samples_uniform)
-        weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
+        # coarse field:
+        field_outputs_coarse = self.field_coarse.forward(ray_samples)
+        weights_coarse = ray_samples.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
         rgb_coarse = self.renderer_rgb(
             rgb=field_outputs_coarse[FieldHeadNames.RGB],
             weights=weights_coarse,
         )
         accumulation_coarse = self.renderer_accumulation(weights_coarse)
-        depth_coarse = self.renderer_depth(weights_coarse, ray_samples_uniform)
+        depth_coarse = self.renderer_depth(weights_coarse, ray_samples)
 
         # pdf sampling
-        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse)
+        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples, weights_coarse)
+        if self.temporal_distortion is not None:
+            offsets = self.temporal_distortion(ray_samples_pdf.frustums.get_positions(), ray_samples_pdf.times)
+            ray_samples_pdf.frustums.set_offsets(offsets)
 
-        # Second pass:
-        field_outputs_fine = self.field.forward(ray_samples_pdf)
+        # fine field:
+        field_outputs_fine = self.field_fine.forward(ray_samples_pdf)
         weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
         rgb_fine = self.renderer_rgb(
             rgb=field_outputs_fine[FieldHeadNames.RGB],
@@ -136,10 +181,14 @@ class MipNerfModel(Model):
         }
         return outputs
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None):
-        image = batch["image"].to(self.device)
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        # Scaling metrics by coefficients to create the losses.
+        device = outputs["rgb_coarse"].device
+        image = batch["image"].to(device)
+
         rgb_loss_coarse = self.rgb_loss(image, outputs["rgb_coarse"])
         rgb_loss_fine = self.rgb_loss(image, outputs["rgb_fine"])
+
         loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
@@ -173,8 +222,6 @@ class MipNerfModel(Model):
         image = torch.moveaxis(image, -1, 0)[None, ...]
         rgb_coarse = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
         rgb_fine = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
-        rgb_coarse = torch.clip(rgb_coarse, min=-1, max=1)
-        rgb_fine = torch.clip(rgb_fine, min=-1, max=1)
 
         coarse_psnr = self.psnr(image, rgb_coarse)
         fine_psnr = self.psnr(image, rgb_fine)
@@ -183,10 +230,10 @@ class MipNerfModel(Model):
 
         metrics_dict = {
             "psnr": float(fine_psnr.item()),
-            "coarse_psnr": float(coarse_psnr.item()),
-            "fine_psnr": float(fine_psnr.item()),
-            "fine_ssim": float(fine_ssim.item()),
-            "fine_lpips": float(fine_lpips.item()),
+            "coarse_psnr": float(coarse_psnr),
+            "fine_psnr": float(fine_psnr),
+            "fine_ssim": float(fine_ssim),
+            "fine_lpips": float(fine_lpips),
         }
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict

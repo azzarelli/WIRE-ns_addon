@@ -34,7 +34,7 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import MSELoss
-from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
+from nerfstudio.model_components.ray_samplers import IRNetworkSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
     DepthRenderer,
@@ -49,16 +49,8 @@ class VanillaModelConfig(ModelConfig):
     """Vanilla Model Config"""
 
     _target: Type = field(default_factory=lambda: NeRFModel)
-    num_coarse_samples: int = 64
-    """Number of samples in coarse field evaluation"""
-    num_importance_samples: int = 128
+    num_samples: int = 128
     """Number of samples in fine field evaluation"""
-
-    enable_temporal_distortion: bool = False
-    """Specifies whether or not to include ray warping based on time."""
-    temporal_distortion_params: Dict[str, Any] = to_immutable_dict({"kind": TemporalDistortionKind.DNERF})
-    """Parameters to instantiate temporal distortion with"""
-
 
 class NeRFModel(Model):
     """Vanilla NeRF model
@@ -93,19 +85,19 @@ class NeRFModel(Model):
             in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=4.0, include_input=True
         )
 
-        self.field_coarse = NeRFField(
-            position_encoding=position_encoding,
-            direction_encoding=direction_encoding,
-        )
-
         self.field_fine = NeRFField(
             position_encoding=position_encoding,
             direction_encoding=direction_encoding,
         )
 
+
         # samplers
-        self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
-        self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples)
+        self.sampler = IRNetworkSampler(in_dim=, # Input needs to be size of viewing direction and camera parameters
+                                        out_dim=self.config.num_samples,
+                                        num_layers=base_mlp_num_layers,
+                                        layer_width=base_mlp_layer_width,
+                                        out_activation=nn.ReLU()
+        )
 
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
@@ -120,93 +112,58 @@ class NeRFModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
-        if getattr(self.config, "enable_temporal_distortion", False):
-            params = self.config.temporal_distortion_params
-            kind = params.pop("kind")
-            self.temporal_distortion = kind.to_temporal_distortion(params)
-
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        if self.field_coarse is None or self.field_fine is None:
+        if self.field_coarse is None:
             raise ValueError("populate_fields() must be called before get_param_groups")
-        param_groups["fields"] = list(self.field_coarse.parameters()) + list(self.field_fine.parameters())
-        if self.temporal_distortion is not None:
-            param_groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
+        param_groups["fields"] = list(self.field_coarse.parameters())
         return param_groups
 
     def get_outputs(self, ray_bundle: RayBundle):
 
-        if self.field_coarse is None or self.field_fine is None:
+        if self.field_coarse is None:
             raise ValueError("populate_fields() must be called before get_outputs")
 
-        # uniform sampling
-        ray_samples_uniform = self.sampler_uniform(ray_bundle)
-        if self.temporal_distortion is not None:
-            offsets = self.temporal_distortion(ray_samples_uniform.frustums.get_positions(), ray_samples_uniform.times)
-            ray_samples_uniform.frustums.set_offsets(offsets)
+        # TODO - Configure Sampling forward call (RayBundle -> RaySample)
+        rayparams = 0 # Ray parameters such as position and viewing angle
+        ray_samples = self.sampler.generate_ray_samples(ray_bundle)
 
-        # coarse field:
-        field_outputs_coarse = self.field_coarse.forward(ray_samples_uniform)
-        weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
-        rgb_coarse = self.renderer_rgb(
-            rgb=field_outputs_coarse[FieldHeadNames.RGB],
-            weights=weights_coarse,
-        )
-        accumulation_coarse = self.renderer_accumulation(weights_coarse)
-        depth_coarse = self.renderer_depth(weights_coarse, ray_samples_uniform)
-
-        # pdf sampling
-        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse)
-        if self.temporal_distortion is not None:
-            offsets = self.temporal_distortion(ray_samples_pdf.frustums.get_positions(), ray_samples_pdf.times)
-            ray_samples_pdf.frustums.set_offsets(offsets)
-
-        # fine field:
-        field_outputs_fine = self.field_fine.forward(ray_samples_pdf)
-        weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
+        # TODO - Ensure Field Outputs are good and can render RGB image
+        field_outputs_fine = self.field_fine.forward(ray_samples)
+        weights_fine = ray_samples.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
         rgb_fine = self.renderer_rgb(
             rgb=field_outputs_fine[FieldHeadNames.RGB],
             weights=weights_fine,
         )
         accumulation_fine = self.renderer_accumulation(weights_fine)
-        depth_fine = self.renderer_depth(weights_fine, ray_samples_pdf)
+        depth_fine = self.renderer_depth(weights_fine, ray_samples)
 
         outputs = {
-            "rgb_coarse": rgb_coarse,
             "rgb_fine": rgb_fine,
-            "accumulation_coarse": accumulation_coarse,
             "accumulation_fine": accumulation_fine,
-            "depth_coarse": depth_coarse,
             "depth_fine": depth_fine,
         }
         return outputs
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Scaling metrics by coefficients to create the losses.
-        device = outputs["rgb_coarse"].device
+        device = outputs["rgb_fine"].device
         image = batch["image"].to(device)
 
-        rgb_loss_coarse = self.rgb_loss(image, outputs["rgb_coarse"])
         rgb_loss_fine = self.rgb_loss(image, outputs["rgb_fine"])
 
-        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+        loss_dict = {"rgb_loss_fine": rgb_loss_fine}
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        image = batch["image"].to(outputs["rgb_coarse"].device)
-        rgb_coarse = outputs["rgb_coarse"]
+
+        image = batch["image"].to(outputs["rgb_fine"].device)
+
         rgb_fine = outputs["rgb_fine"]
-        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
         acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
-        depth_coarse = colormaps.apply_depth_colormap(
-            outputs["depth_coarse"],
-            accumulation=outputs["accumulation_coarse"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
-        )
         depth_fine = colormaps.apply_depth_colormap(
             outputs["depth_fine"],
             accumulation=outputs["accumulation_fine"],
@@ -214,23 +171,20 @@ class NeRFModel(Model):
             far_plane=self.config.collider_params["far_plane"],
         )
 
-        combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)
+        combined_rgb = torch.cat([image, rgb_fine], dim=1)
         combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
         combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb_coarse = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
         rgb_fine = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
 
-        coarse_psnr = self.psnr(image, rgb_coarse)
         fine_psnr = self.psnr(image, rgb_fine)
         fine_ssim = self.ssim(image, rgb_fine)
         fine_lpips = self.lpips(image, rgb_fine)
 
         metrics_dict = {
             "psnr": float(fine_psnr.item()),
-            "coarse_psnr": float(coarse_psnr),
             "fine_psnr": float(fine_psnr),
             "fine_ssim": float(fine_ssim),
             "fine_lpips": float(fine_lpips),
